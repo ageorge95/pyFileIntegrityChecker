@@ -1,4 +1,4 @@
-# pyMultiTimer
+# pyFileIntegrityChecker
 Simple python application that can check the integrity of files.
 
 The storage medium of the files does not matter, it can be an HDD, SSD or even a network drive.
