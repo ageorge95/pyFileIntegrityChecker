@@ -1,0 +1,7 @@
+/.idea
+/__pycache__
+/venv
+/activate.bat
+/build
+/dist
+file_checker_data.json
