@@ -8,7 +8,8 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QProgressBar, QPushButton, QFileDialog,
-    QSlider, QLabel, QHeaderView, QAbstractItemView, QComboBox
+    QSlider, QLabel, QHeaderView, QAbstractItemView, QComboBox, QTextEdit,
+    QMessageBox, QDialog
 )
 from PySide6.QtGui import QIcon
 
@@ -83,6 +84,47 @@ class FileReadWorker(QThread):
                 self.verdict.emit(str(path), False)
         self.finished_all.emit()
 
+class AddFilesDialog(QDialog):
+    files_added = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add file paths")
+        self.resize(500, 300)
+        self.setModal(True)          # makes it a top-level dialog, no transparency
+
+        vbox = QVBoxLayout(self)
+
+        self.text = QTextEdit()
+        vbox.addWidget(QLabel("Paste one file path per line:"))
+        vbox.addWidget(self.text)
+
+        h = QHBoxLayout()
+        btn_add = QPushButton("Add")
+        btn_cancel = QPushButton("Cancel")
+        btn_add.clicked.connect(self._add)
+        btn_cancel.clicked.connect(self.reject)
+        h.addWidget(btn_add)
+        h.addWidget(btn_cancel)
+        vbox.addLayout(h)
+
+    def _add(self):
+        raw_lines = self.text.toPlainText().splitlines()
+        files = [Path(p.strip()) for p in raw_lines if p.strip()]
+        existing = [f for f in files if f.is_file()]
+        non_existing = [f for f in files if not f.is_file()]
+
+        if non_existing:
+            QMessageBox.warning(
+                self,
+                "Some paths not found",
+                "The following files were not added:\n\n" +
+                "\n".join(str(f) for f in non_existing)
+            )
+        if existing:
+            self.files_added.emit(existing)
+        self.accept()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -113,6 +155,11 @@ class MainWindow(QMainWindow):
         h1.addWidget(self.folder_label)
         h1.addWidget(btn_browse)
         vbox.addLayout(h1)
+
+        # Add file paths manually
+        self.btn_add_files = QPushButton("Add files…")
+        self.btn_add_files.clicked.connect(self.add_files_manually)
+        h1.addWidget(self.btn_add_files)
 
         # Speed slider
         h2 = QHBoxLayout()
@@ -170,6 +217,38 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(widget)
 
+    def add_files_manually(self):
+        dlg = AddFilesDialog(self)
+        dlg.files_added.connect(self._insert_files)
+        dlg.show()
+
+    def _insert_files(self, files):
+        # files is a list of pathlib.Path objects that already exist
+        row0 = self.table.rowCount()
+        self.table.setRowCount(row0 + len(files))
+
+        for offset, f in enumerate(files):
+            row = row0 + offset
+            self.data[str(f)] = {
+                'size': f.stat().st_size,
+                'progress': 0,
+                'cur_speed': 0.0,
+                'min_speed': None,
+                'max_wait': None,
+                'verdict': ''
+            }
+            self.table.setItem(row, 0, QTableWidgetItem(f.name))
+            self.table.setItem(row, 1, QTableWidgetItem(self._format_size(f.stat().st_size)))
+            self.table.setCellWidget(row, 2, QProgressBar())
+            self.table.setItem(row, 3, QTableWidgetItem("0.00"))
+            self.table.setItem(row, 4, QTableWidgetItem(""))
+            self.table.setItem(row, 5, QTableWidgetItem(""))
+            self.table.setItem(row, 6, QTableWidgetItem(""))
+
+        # update the visible-rows counter and re-apply the current filter
+        self.counter_label.setText(f"Entries: {self.table.rowCount()}")
+        self.apply_filter(self.filter_combo.currentText())
+
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder")
         if folder:
@@ -219,12 +298,11 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 6, QTableWidgetItem(""))
 
     def start_scan(self):
-        if not self.folder:
-            return
         self.status.setText("Working")
         self.b_start.setEnabled(False)
         self.b_stop.setEnabled(True)
         self.stop_event.clear()
+
         tasks = []
         for fpath, stats in self.data.items():
             if stats.get('verdict') == 'OK':
@@ -232,6 +310,13 @@ class MainWindow(QMainWindow):
             size = stats['size']
             start_bytes = int(stats['progress'] / 100 * size)
             tasks.append((Path(fpath), start_bytes))
+
+        if not tasks:
+            self.status.setText("Nothing to scan")
+            self.b_start.setEnabled(True)
+            self.b_stop.setEnabled(False)
+            return
+
         self.worker = FileReadWorker(tasks, 1, self.slider.value(), self.stop_event)
         self.worker.progress.connect(self.update_progress)
         self.worker.current_speed.connect(self.update_current_speed)
@@ -297,27 +382,69 @@ class MainWindow(QMainWindow):
             print(f"Error saving data: {e}")
 
     def _load_data(self):
-        if data_file.exists():
-            try:
-                state = json.loads(data_file.read_text())
-                folder = state.get('folder', '')
-                if folder and os.path.isdir(folder):
-                    self.folder = Path(folder)
-                    self.folder_label.setText(folder)
-                    self._populate_table()
-                for fpath, stats in state.get('files', {}).items():
-                    if fpath in self.data:
-                        self.update_progress(fpath, stats.get('progress', 0))
-                        self.update_current_speed(fpath, stats.get('cur_speed', 0.0))
-                        if stats.get('min_speed') is not None:
-                            self.update_min_speed(fpath, stats['min_speed'])
-                        if stats.get('max_wait') is not None:
-                            self.update_max_wait(fpath, stats['max_wait'])
-                        if stats.get('verdict'):
-                            self.update_verdict(fpath, stats['verdict'] == 'OK')
-                self.slider.setValue(state.get('speed_limit', 10))
-            except Exception as e:
-                print(f"Error loading data: {e}")
+        if not data_file.exists():
+            return
+        try:
+            state = json.loads(data_file.read_text())
+
+            # restore speed slider
+            self.slider.setValue(state.get('speed_limit', 10))
+
+            # restore last folder if it still exists
+            folder = state.get('folder', '')
+            if folder and os.path.isdir(folder):
+                self.folder = Path(folder)
+                self.folder_label.setText(folder)
+
+            # restore *all* valid file entries, no matter where they are
+            restored_files = 0
+            for fpath_str, stats in state.get('files', {}).items():
+                fpath = Path(fpath_str)
+                if not fpath.is_file():
+                    continue  # skip missing files
+
+                self.data[str(fpath)] = {
+                    'size': fpath.stat().st_size,
+                    'progress': stats.get('progress', 0),
+                    'cur_speed': stats.get('cur_speed', 0.0),
+                    'min_speed': stats.get('min_speed'),
+                    'max_wait': stats.get('max_wait'),
+                    'verdict': stats.get('verdict', '')
+                }
+                restored_files += 1
+
+            # rebuild the table to show all restored entries
+            self._repopulate_table_from_data()
+            self.apply_filter(self.filter_combo.currentText())
+
+        except Exception as e:
+            print(f"Error loading data: {e}")
+
+    # helper: recreate the table from self.data
+    def _repopulate_table_from_data(self):
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(self.data))
+        for row, (fpath_str, stats) in enumerate(self.data.items()):
+            fpath = Path(fpath_str)
+            self.table.setItem(row, 0, QTableWidgetItem(fpath.name))
+            self.table.setItem(row, 1, QTableWidgetItem(self._format_size(stats['size'])))
+            bar = QProgressBar()
+            bar.setValue(stats['progress'])
+            self.table.setCellWidget(row, 2, bar)
+            self.table.setItem(row, 3, QTableWidgetItem(f"{stats['cur_speed']:.2f}"))
+            self.table.setItem(row, 4,
+                               QTableWidgetItem("" if stats['min_speed'] is None else f"{stats['min_speed']:.2f}"))
+            self.table.setItem(row, 5,
+                               QTableWidgetItem("" if stats['max_wait'] is None else f"{stats['max_wait']:.3f}"))
+            verdict = stats.get('verdict', '')
+            item = QTableWidgetItem(verdict)
+            if verdict == 'OK':
+                item.setBackground(Qt.green)
+            elif verdict == 'BAD':
+                item.setBackground(Qt.red)
+            self.table.setItem(row, 6, item)
+
+        self.counter_label.setText(f"Entries: {len(self.data)}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
