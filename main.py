@@ -239,7 +239,7 @@ class MainWindow(QMainWindow):
             }
             self.table.setItem(row, 0, QTableWidgetItem(f.name))
             self.table.setItem(row, 1, QTableWidgetItem(self._format_size(f.stat().st_size)))
-            self.table.setCellWidget(row, 2, QProgressBar())
+            self.table.setCellWidget(row, 2, QProgressBar(value=0))
             self.table.setItem(row, 3, QTableWidgetItem("0.00"))
             self.table.setItem(row, 4, QTableWidgetItem(""))
             self.table.setItem(row, 5, QTableWidgetItem(""))
@@ -291,7 +291,7 @@ class MainWindow(QMainWindow):
                                   'min_speed': None, 'max_wait': None, 'verdict': ''}
             self.table.setItem(i, 0, QTableWidgetItem(name))
             self.table.setItem(i, 1, QTableWidgetItem(self._format_size(size)))
-            self.table.setCellWidget(i, 2, QProgressBar())
+            self.table.setCellWidget(i, 2, QProgressBar(value=0))
             self.table.setItem(i, 3, QTableWidgetItem("0.00"))
             self.table.setItem(i, 4, QTableWidgetItem(""))
             self.table.setItem(i, 5, QTableWidgetItem(""))
@@ -428,8 +428,7 @@ class MainWindow(QMainWindow):
             fpath = Path(fpath_str)
             self.table.setItem(row, 0, QTableWidgetItem(fpath.name))
             self.table.setItem(row, 1, QTableWidgetItem(self._format_size(stats['size'])))
-            bar = QProgressBar()
-            bar.setValue(stats['progress'])
+            bar = QProgressBar(value=stats['progress'])
             self.table.setCellWidget(row, 2, bar)
             self.table.setItem(row, 3, QTableWidgetItem(f"{stats['cur_speed']:.2f}"))
             self.table.setItem(row, 4,
