@@ -215,6 +215,11 @@ class MainWindow(QMainWindow):
         h3.addWidget(self.b_stop)
         vbox.addLayout(h3)
 
+        # Clear button
+        self.b_clear = QPushButton("Clear all")
+        self.b_clear.clicked.connect(self.clear_all)
+        h3.addWidget(self.b_clear)
+
         self.setCentralWidget(widget)
 
     def add_files_manually(self):
@@ -255,6 +260,26 @@ class MainWindow(QMainWindow):
             self.folder = Path(folder)
             self.folder_label.setText(folder)
             self._populate_table()
+
+    def clear_all(self):
+        """Stop any running scan and remove every entry."""
+        # 1. Stop the worker if it’s running
+        if self.worker and self.worker.isRunning():
+            self.stop_scan()  # set the stop-event
+            self.worker.wait()  # block until thread exits
+
+        # 2. Now it’s safe to wipe everything
+        self.data.clear()
+        self.table.setRowCount(0)
+        self.counter_label.setText("Entries: 0")
+        self.folder = None
+        self.folder_label.setText("No folder selected")
+
+        # 3. Delete persistent file
+        try:
+            data_file.unlink(missing_ok=True)
+        except Exception as e:
+            print("Could not delete data file:", e)
 
     def on_speed_change(self, value):
         self.speed_label.setText(f"{value} MB/s")
@@ -335,6 +360,8 @@ class MainWindow(QMainWindow):
         self.b_stop.setEnabled(False)
 
     def update_progress(self, fname, p):
+        if fname not in self.data:
+            return
         self.data[fname]['progress'] = p
         for i in range(self.table.rowCount()):
             if self.table.item(i, 0).text() == Path(fname).name:
@@ -343,18 +370,26 @@ class MainWindow(QMainWindow):
                 break
 
     def update_current_speed(self, fname, speed):
+        if fname not in self.data:
+            return
         self.data[fname]['cur_speed'] = speed
         self._set_item(fname, 3, f"{speed:.2f}")
 
     def update_min_speed(self, fname, s):
+        if fname not in self.data:
+            return
         self.data[fname]['min_speed'] = s
         self._set_item(fname, 4, f"{s:.2f}")
 
     def update_max_wait(self, fname, w):
+        if fname not in self.data:
+            return
         self.data[fname]['max_wait'] = w
         self._set_item(fname, 5, f"{w:.3f}")
 
     def update_verdict(self, fname, ok):
+        if fname not in self.data:
+            return
         text = 'OK' if ok else 'BAD'
         self.data[fname]['verdict'] = text
         item = QTableWidgetItem(text)
