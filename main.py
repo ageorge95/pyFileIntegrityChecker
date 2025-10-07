@@ -51,23 +51,45 @@ class FileReadWorker(QThread):
                 min_speed_val = float('inf')
                 max_wait_val = 0
                 completed = False
+
+                # This handles the case of an empty file, which would otherwise
+                # not emit any verdict.
+                if file_size == 0:
+                    self.verdict.emit(str(path), True)
+                    self.progress.emit(str(path), 100)
+                    continue
+
                 with open(path, 'rb') as f:
                     f.seek(read)
                     while read < file_size:
                         if self.stop_event.is_set():
                             break
+
                         t0 = time.time()
                         data = f.read(self.chunk_size)
+
+                        # A robust way to handle the end of the file.
+                        # If f.read() returns nothing, we're done.
                         if not data:
                             break
+
                         elapsed = time.time() - t0
-                        wait = max(0, (len(data)/1024/1024/self.speed_limit) - elapsed)
+                        wait = max(0, (len(data) / 1024 / 1024 / self.speed_limit) - elapsed)
                         time.sleep(wait)
                         block_time = time.time() - t0
-                        speed_val = len(data)/1024/1024/block_time
-                        if speed_val < self.MIN_SPEED_MB_S:
+
+                        # Avoid division by zero on extremely fast reads
+                        if block_time == 0:
+                            speed_val = float('inf')
+                        else:
+                            speed_val = len(data) / 1024 / 1024 / block_time
+
+                        # Only perform the speed check on a FULL chunk.
+                        # The last chunk will be smaller and could give a false negative.
+                        if len(data) == self.chunk_size and speed_val < self.MIN_SPEED_MB_S:
                             self.verdict.emit(str(path), False)
                             break
+
                         self.current_speed.emit(str(path), speed_val)
                         min_speed_val = min(min_speed_val, speed_val)
                         max_wait_val = max(max_wait_val, wait)
@@ -77,11 +99,16 @@ class FileReadWorker(QThread):
                         self.min_speed.emit(str(path), min_speed_val)
                         self.max_wait.emit(str(path), max_wait_val)
                     else:
+                        # This 'else' block runs only if the 'while' loop completes
+                        # without a 'break'. This means the file was read completely.
                         completed = True
+
                 if completed:
                     self.verdict.emit(str(path), True)
+
             except Exception:
                 self.verdict.emit(str(path), False)
+
         self.finished_all.emit()
 
 class AddFilesDialog(QDialog):
