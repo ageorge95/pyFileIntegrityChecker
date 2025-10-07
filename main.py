@@ -135,8 +135,17 @@ class FileReadWorker(QThread):
                         completed = True
 
                 if completed:
-                    # Send a final update to ensure progress is 100% and verdict is set
+                    # For files that process faster than the GUI update interval, no signals
+                    # would have been sent. This block ensures a final, complete update is
+                    # always sent upon successful completion.
+                    final_speed = speed_val
+                    final_min_speed = min(min_speed_val, final_speed)
+                    final_max_wait = max(max_wait_val, sleep_duration)
+
                     self.progress.emit(str(path), 100)
+                    self.current_speed.emit(str(path), final_speed)
+                    self.min_speed.emit(str(path), final_min_speed)
+                    self.max_wait.emit(str(path), final_max_wait)
                     self.verdict.emit(str(path), True)
 
             except Exception as e:
