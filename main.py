@@ -42,22 +42,29 @@ class FileReadWorker(QThread):
         self.stop_event = stop_event
 
     def run(self):
+        # We read in smaller sub-chunks to smooth out the speed.
+        SUB_CHUNK_SIZE = 64 * 1024  # 64 KB
+
+        # We only send signals to the GUI at a fixed interval.
+        GUI_UPDATE_INTERVAL_S = 0.2  # 5 updates per second
+
         for path, start in self.tasks:
             if self.stop_event.is_set():
                 break
+
             try:
                 file_size = path.stat().st_size
+                if file_size == 0:
+                    self.verdict.emit(str(path), True)
+                    self.progress.emit(str(path), 100)
+                    continue
+
                 read = start
                 min_speed_val = float('inf')
                 max_wait_val = 0
                 completed = False
 
-                # This handles the case of an empty file, which would otherwise
-                # not emit any verdict.
-                if file_size == 0:
-                    self.verdict.emit(str(path), True)
-                    self.progress.emit(str(path), 100)
-                    continue
+                last_gui_update_time = time.time()
 
                 with open(path, 'rb') as f:
                     f.seek(read)
@@ -65,48 +72,75 @@ class FileReadWorker(QThread):
                         if self.stop_event.is_set():
                             break
 
-                        t0 = time.time()
-                        data = f.read(self.chunk_size)
+                        chunk_read_start_time = time.time()
+                        bytes_read_in_chunk = 0
 
-                        # A robust way to handle the end of the file.
-                        # If f.read() returns nothing, we're done.
-                        if not data:
+                        # This inner loop reads one 'self.chunk_size' in smaller pieces
+                        while bytes_read_in_chunk < self.chunk_size and read < file_size:
+                            if self.stop_event.is_set():
+                                break
+
+                            # Calculate sleep time based on the small sub-chunk size
+                            # to maintain the target speed limit.
+                            bytes_to_read = min(SUB_CHUNK_SIZE, self.chunk_size - bytes_read_in_chunk, file_size - read)
+
+                            # Target time for this sub-chunk
+                            target_time_per_sub_chunk = (bytes_to_read / (1024 * 1024)) / self.speed_limit
+
+                            sub_chunk_t0 = time.time()
+                            data = f.read(bytes_to_read)
+                            if not data:
+                                break  # End of file reached unexpectedly
+
+                            elapsed_for_sub_chunk = time.time() - sub_chunk_t0
+
+                            # Sleep to throttle the speed
+                            sleep_duration = max(0, target_time_per_sub_chunk - elapsed_for_sub_chunk)
+                            time.sleep(sleep_duration)
+
+                            read += len(data)
+                            bytes_read_in_chunk += len(data)
+
+                        if not data:  # Break outer loop if EOF was hit
                             break
 
-                        elapsed = time.time() - t0
-                        wait = max(0, (len(data) / 1024 / 1024 / self.speed_limit) - elapsed)
-                        time.sleep(wait)
-                        block_time = time.time() - t0
-
-                        # Avoid division by zero on extremely fast reads
-                        if block_time == 0:
+                        # Now calculate metrics for the whole chunk that was just processed
+                        chunk_total_time = time.time() - chunk_read_start_time
+                        if chunk_total_time == 0:
                             speed_val = float('inf')
                         else:
-                            speed_val = len(data) / 1024 / 1024 / block_time
+                            speed_val = (bytes_read_in_chunk / (1024 * 1024)) / chunk_total_time
 
-                        # Only perform the speed check on a FULL chunk.
-                        # The last chunk will be smaller and could give a false negative.
-                        if len(data) == self.chunk_size and speed_val < self.MIN_SPEED_MB_S:
+                        # Only perform speed check on full chunks to avoid false negatives at EOF
+                        if bytes_read_in_chunk == self.chunk_size and speed_val < self.MIN_SPEED_MB_S:
                             self.verdict.emit(str(path), False)
-                            break
+                            break  # Stop processing this file
 
-                        self.current_speed.emit(str(path), speed_val)
-                        min_speed_val = min(min_speed_val, speed_val)
-                        max_wait_val = max(max_wait_val, wait)
-                        read += len(data)
-                        pct = int(read * 100 / file_size)
-                        self.progress.emit(str(path), pct)
-                        self.min_speed.emit(str(path), min_speed_val)
-                        self.max_wait.emit(str(path), max_wait_val)
+                        # Check if it's time to send an update to the GUI
+                        current_time = time.time()
+                        if current_time - last_gui_update_time > GUI_UPDATE_INTERVAL_S:
+                            min_speed_val = min(min_speed_val, speed_val)
+                            max_wait_val = max(max_wait_val, sleep_duration)
+
+                            pct = int(read * 100 / file_size)
+
+                            self.current_speed.emit(str(path), speed_val)
+                            self.progress.emit(str(path), pct)
+                            self.min_speed.emit(str(path), min_speed_val)
+                            self.max_wait.emit(str(path), max_wait_val)
+                            last_gui_update_time = current_time
                     else:
                         # This 'else' block runs only if the 'while' loop completes
                         # without a 'break'. This means the file was read completely.
                         completed = True
 
                 if completed:
+                    # Send a final update to ensure progress is 100% and verdict is set
+                    self.progress.emit(str(path), 100)
                     self.verdict.emit(str(path), True)
 
-            except Exception:
+            except Exception as e:
+                print(f"Error processing {path}: {e}")  # Good to log errors
                 self.verdict.emit(str(path), False)
 
         self.finished_all.emit()
