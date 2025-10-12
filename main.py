@@ -374,16 +374,17 @@ class MainWindow(QMainWindow):
         return f"{b/1024**3:.2f} GB" if b >= 1024**3 else f"{b/1024**2:.2f} MB"
 
     def _populate_table(self):
-        files = [f for f in self.folder.iterdir() if f.is_file()]
+        # Get all files recursively from all subfolders
+        files = [f for f in self.folder.rglob('*') if f.is_file()]
         self.table.setRowCount(len(files))
         # update counter
         self.counter_label.setText(f"Entries: {len(files)}")
         self.data = {}
         for i, f in enumerate(files):
-            name = f.name
+            name = str(f.relative_to(self.folder))  # Show relative path from root folder
             size = f.stat().st_size
             self.data[str(f)] = {'size': size, 'progress': 0, 'cur_speed': 0.0,
-                                  'min_speed': None, 'max_wait': None, 'verdict': ''}
+                                 'min_speed': None, 'max_wait': None, 'verdict': ''}
             self.table.setItem(i, 0, QTableWidgetItem(name))
             self.table.setItem(i, 1, QTableWidgetItem(self._format_size(size)))
             self.table.setCellWidget(i, 2, QProgressBar(value=0))
