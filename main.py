@@ -105,10 +105,13 @@ class FileReadWorker(QThread):
 
     def run(self):
         # We read in smaller sub-chunks to smooth out the speed.
-        SUB_CHUNK_SIZE = 64 * 1024  # 64 KB
+        SUB_CHUNK_SIZE = 512 * 1024  # 512 KB
 
         # We only send signals to the GUI at a fixed interval.
-        GUI_UPDATE_INTERVAL_S = 0.2  # 5 updates per second
+        if self.speed_limit > 50:
+            GUI_UPDATE_INTERVAL_S = 0.5  # 2 updates per second for high speeds
+        else:
+            GUI_UPDATE_INTERVAL_S = 0.2  # 5 updates per second for normal speeds
 
         for path, start in self.tasks:
             if self.stop_event.is_set():
@@ -303,7 +306,7 @@ class MainWindow(QMainWindow):
         h2 = QHBoxLayout()
         h2.addWidget(QLabel("Speed (MB/s):"))
         self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(1, 100)
+        self.slider.setRange(1, 200)
         self.slider.setValue(10)
         self.slider.valueChanged.connect(self.on_speed_change)
         self.speed_label = QLabel(f"{self.slider.value()} MB/s")
