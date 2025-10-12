@@ -4,7 +4,7 @@ import json
 import time
 from pathlib import Path
 from threading import Event
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex, QMutexLocker
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QProgressBar, QPushButton, QFileDialog,
@@ -22,6 +22,68 @@ def get_running_path(relative_path):
         return os.path.join('_internal', relative_path)
     else:
         return relative_path
+
+
+class SaveWorker(QThread):
+    """Thread for saving data to avoid GUI freezes"""
+    save_complete = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(self, data_file):
+        super().__init__()
+        self.data_file = data_file
+        self.mutex = QMutex()
+        self.pending_data = None
+        self.shutdown = False
+
+    def schedule_save(self, data):
+        """Schedule data to be saved - thread safe"""
+        with QMutexLocker(self.mutex):
+            self.pending_data = data
+        if not self.isRunning():
+            self.start()
+
+    def stop_worker(self):
+        """Gracefully stop the worker"""
+        self.shutdown = True
+        if self.isRunning():
+            self.wait(5000)  # Wait up to 5 seconds
+
+    def run(self):
+        while not self.shutdown:
+            # Get pending data thread-safely
+            with QMutexLocker(self.mutex):
+                data_to_save = self.pending_data
+                self.pending_data = None
+
+            if data_to_save is not None:
+                try:
+                    # Save to temporary file first, then rename (atomic operation)
+                    temp_file = self.data_file.with_suffix('.tmp')
+                    with open(temp_file, 'w') as f:
+                        json.dump(data_to_save, f, indent=2)
+
+                    # Atomic replace
+                    if os.name == 'nt':  # Windows
+                        # On Windows, we can't atomically replace, so we'll just overwrite
+                        if self.data_file.exists():
+                            self.data_file.unlink()
+                        temp_file.rename(self.data_file)
+                    else:  # Unix-like systems
+                        temp_file.replace(self.data_file)
+
+                    self.save_complete.emit()
+                except Exception as e:
+                    self.error_occurred.emit(f"Error saving data: {e}")
+
+            # Sleep a bit to prevent busy waiting
+            self.msleep(100)
+
+            # If no more data and shutdown requested, exit
+            with QMutexLocker(self.mutex):
+                if self.shutdown and self.pending_data is None:
+                    break
+
 
 class FileReadWorker(QThread):
     progress = Signal(str, int)
@@ -161,7 +223,7 @@ class AddFilesDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Add file paths")
         self.resize(500, 300)
-        self.setModal(True)          # makes it a top-level dialog, no transparency
+        self.setModal(True)  # makes it a top-level dialog, no transparency
 
         vbox = QVBoxLayout(self)
 
@@ -209,8 +271,14 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._load_data()
 
+        # Create save worker
+        self.save_worker = SaveWorker(data_file)
+        self.save_worker.save_complete.connect(self._on_save_complete)
+        self.save_worker.error_occurred.connect(self._on_save_error)
+
+        # Timer to trigger saves
         self.autosave_timer = QTimer(self)
-        self.autosave_timer.timeout.connect(self.save_data)
+        self.autosave_timer.timeout.connect(self._schedule_save)
         self.autosave_timer.start(AUTO_SAVE_INTERVAL_MS)
 
     def _setup_ui(self):
@@ -292,6 +360,31 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(widget)
 
+    def closeEvent(self, event):
+        """Ensure save worker is properly stopped on application close"""
+        self.save_worker.stop_worker()
+        event.accept()
+
+    def _schedule_save(self):
+        """Schedule a save operation in the background thread"""
+        if self.data:
+            state = {
+                'folder': str(self.folder) if self.folder else '',
+                'speed_limit': self.slider.value(),
+                'files': self.data
+            }
+            self.save_worker.schedule_save(state)
+
+    def _on_save_complete(self):
+        """Called when save operation completes successfully"""
+        # Optional: You could add a brief status message here
+        pass
+
+    def _on_save_error(self, error_msg):
+        """Called when save operation fails"""
+        print(error_msg)  # Log the error
+        # Optional: Show a non-intrusive message to the user
+
     def add_files_manually(self):
         dlg = AddFilesDialog(self)
         dlg.files_added.connect(self._insert_files)
@@ -333,19 +426,22 @@ class MainWindow(QMainWindow):
 
     def clear_all(self):
         """Stop any running scan and remove every entry."""
-        # 1. Stop the worker if it’s running
+        # 1. Stop the worker if it's running
         if self.worker and self.worker.isRunning():
             self.stop_scan()  # set the stop-event
             self.worker.wait()  # block until thread exits
 
-        # 2. Now it’s safe to wipe everything
+        # 2. Stop save worker
+        self.save_worker.stop_worker()
+
+        # 3. Now it's safe to wipe everything
         self.data.clear()
         self.table.setRowCount(0)
         self.counter_label.setText("Entries: 0")
         self.folder = None
         self.folder_label.setText("No folder selected")
 
-        # 3. Delete persistent file
+        # 4. Delete persistent file
         try:
             data_file.unlink(missing_ok=True)
         except Exception as e:
@@ -371,7 +467,7 @@ class MainWindow(QMainWindow):
         self.counter_label.setText(f"Entries: {visible}")
 
     def _format_size(self, b):
-        return f"{b/1024**3:.2f} GB" if b >= 1024**3 else f"{b/1024**2:.2f} MB"
+        return f"{b / 1024 ** 3:.2f} GB" if b >= 1024 ** 3 else f"{b / 1024 ** 2:.2f} MB"
 
     def _populate_table(self):
         # Get all files recursively from all subfolders
@@ -497,14 +593,6 @@ class MainWindow(QMainWindow):
             if self.table.item(i, 0).text() == rel_path:
                 self.table.setItem(i, col, item)
                 break
-
-    def save_data(self):
-        try:
-            state = {'folder': str(self.folder), 'speed_limit': self.slider.value(), 'files': self.data}
-            with open(data_file, 'w') as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            print(f"Error saving data: {e}")
 
     def _load_data(self):
         if not data_file.exists():
