@@ -338,9 +338,21 @@ class MainWindow(QMainWindow):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         vbox.addWidget(self.table)
 
-        # Counter label
+        # Counter label and progress bar
+        counter_layout = QHBoxLayout()
         self.counter_label = QLabel("Entries: 0")
-        vbox.addWidget(self.counter_label)
+        counter_layout.addWidget(self.counter_label)
+
+        # Add progress bar for overall scan progress
+        self.overall_progress_bar = QProgressBar()
+        self.overall_progress_bar.setMinimum(0)
+        self.overall_progress_bar.setMaximum(100)
+        self.overall_progress_bar.setValue(0)
+        self.overall_progress_bar.setFormat("%v/%m (%p%)")  # Shows current/max (percentage)
+        self.overall_progress_bar.setVisible(True)
+        counter_layout.addWidget(self.overall_progress_bar)
+
+        vbox.addLayout(counter_layout)
 
         # Start/Stop buttons
         h3 = QHBoxLayout()
@@ -359,6 +371,28 @@ class MainWindow(QMainWindow):
         h3.addWidget(self.b_clear)
 
         self.setCentralWidget(widget)
+
+    def _update_overall_progress(self):
+        """Update the overall progress bar based on completed files"""
+        if not self.data:
+            self.overall_progress_bar.setValue(0)
+            self.overall_progress_bar.setMaximum(0)
+            return
+
+        total_files = len(self.data)
+        completed_files = 0
+
+        for stats in self.data.values():
+            if stats.get('verdict') in ['OK', 'BAD']:
+                completed_files += 1
+
+        self.overall_progress_bar.setMaximum(total_files)
+        self.overall_progress_bar.setValue(completed_files)
+
+        # Update tooltip with detailed information
+        tooltip = f"Completed: {completed_files}/{total_files} files\n"
+        tooltip += f"Remaining: {total_files - completed_files} files"
+        self.overall_progress_bar.setToolTip(tooltip)
 
     def closeEvent(self, event):
         """Ensure save worker is properly stopped on application close"""
@@ -415,6 +449,7 @@ class MainWindow(QMainWindow):
 
         # update the visible-rows counter and re-apply the current filter
         self.counter_label.setText(f"Entries: {self.table.rowCount()}")
+        self._update_overall_progress()
         self.apply_filter(self.filter_combo.currentText())
 
     def browse_folder(self):
@@ -438,6 +473,8 @@ class MainWindow(QMainWindow):
         self.data.clear()
         self.table.setRowCount(0)
         self.counter_label.setText("Entries: 0")
+        self.overall_progress_bar.setValue(0)
+        self.overall_progress_bar.setMaximum(0)
         self.folder = None
         self.folder_label.setText("No folder selected")
 
@@ -489,6 +526,8 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, 5, QTableWidgetItem(""))
             self.table.setItem(i, 6, QTableWidgetItem(""))
 
+        self._update_overall_progress()
+
     def start_scan(self):
         self.status.setText("Working")
         self.b_start.setEnabled(False)
@@ -525,6 +564,7 @@ class MainWindow(QMainWindow):
         self.status.setText("Stopped")
         self.b_start.setEnabled(True)
         self.b_stop.setEnabled(False)
+        self._update_overall_progress()
 
     def update_progress(self, fname, p):
         if fname not in self.data:
@@ -569,6 +609,8 @@ class MainWindow(QMainWindow):
         item = QTableWidgetItem(text)
         item.setBackground(Qt.green if ok else Qt.red)
         self._place_item(fname, 6, item)
+        # Update overall progress when a file gets a verdict
+        self._update_overall_progress()
 
     def _set_item(self, fpath, col, val):
         # Convert to relative path for comparison
@@ -629,6 +671,7 @@ class MainWindow(QMainWindow):
             # rebuild the table to show all restored entries
             self._repopulate_table_from_data()
             self.apply_filter(self.filter_combo.currentText())
+            self._update_overall_progress()
 
         except Exception as e:
             print(f"Error loading data: {e}")
