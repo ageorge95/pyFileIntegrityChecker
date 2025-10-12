@@ -434,8 +434,15 @@ class MainWindow(QMainWindow):
         if fname not in self.data:
             return
         self.data[fname]['progress'] = p
+
+        # Convert to relative path for comparison
+        if self.folder:
+            rel_path = str(Path(fname).relative_to(self.folder))
+        else:
+            rel_path = Path(fname).name
+
         for i in range(self.table.rowCount()):
-            if self.table.item(i, 0).text() == Path(fname).name:
+            if self.table.item(i, 0).text() == rel_path:
                 # Only update the progress bar widget, not replace it
                 self.table.cellWidget(i, 2).setValue(p)
                 break
@@ -468,14 +475,26 @@ class MainWindow(QMainWindow):
         self._place_item(fname, 6, item)
 
     def _set_item(self, fpath, col, val):
+        # Convert to relative path for comparison
+        if self.folder:
+            rel_path = str(Path(fpath).relative_to(self.folder))
+        else:
+            rel_path = Path(fpath).name
+
         for i in range(self.table.rowCount()):
-            if self.table.item(i, 0).text() == Path(fpath).name:
+            if self.table.item(i, 0).text() == rel_path:
                 self.table.setItem(i, col, QTableWidgetItem(val))
                 break
 
     def _place_item(self, fpath, col, item):
+        # Convert to relative path for comparison
+        if self.folder:
+            rel_path = str(Path(fpath).relative_to(self.folder))
+        else:
+            rel_path = Path(fpath).name
+
         for i in range(self.table.rowCount()):
-            if self.table.item(i, 0).text() == Path(fpath).name:
+            if self.table.item(i, 0).text() == rel_path:
                 self.table.setItem(i, col, item)
                 break
 
@@ -532,7 +551,14 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(self.data))
         for row, (fpath_str, stats) in enumerate(self.data.items()):
             fpath = Path(fpath_str)
-            self.table.setItem(row, 0, QTableWidgetItem(fpath.name))
+
+            # Use relative path if we have a folder context, otherwise use filename
+            if self.folder and fpath.is_relative_to(self.folder):
+                display_name = str(fpath.relative_to(self.folder))
+            else:
+                display_name = fpath.name
+
+            self.table.setItem(row, 0, QTableWidgetItem(display_name))
             self.table.setItem(row, 1, QTableWidgetItem(self._format_size(stats['size'])))
             bar = QProgressBar(value=stats['progress'])
             self.table.setCellWidget(row, 2, bar)
