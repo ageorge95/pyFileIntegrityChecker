@@ -105,7 +105,12 @@ class FileReadWorker(QThread):
 
     def run(self):
         # We read in smaller sub-chunks to smooth out the speed.
-        SUB_CHUNK_SIZE = 512 * 1024  # 512 KB
+        if self.speed_limit > 100:
+            SUB_CHUNK_SIZE = 1024 * 1024  # 1MB for very high speeds
+        elif self.speed_limit > 50:
+            SUB_CHUNK_SIZE = 512 * 1024  # 512KB
+        else:
+            SUB_CHUNK_SIZE = 64 * 1024  # 64KB for low speeds
 
         # We only send signals to the GUI at a fixed interval.
         if self.speed_limit > 50:
@@ -139,6 +144,7 @@ class FileReadWorker(QThread):
 
                         chunk_read_start_time = time.time()
                         bytes_read_in_chunk = 0
+                        sum_of_sleep_times = 0.0  # Initialize sleep time tracker
 
                         # This inner loop reads one 'self.chunk_size' in smaller pieces
                         while bytes_read_in_chunk < self.chunk_size and read < file_size:
@@ -162,6 +168,7 @@ class FileReadWorker(QThread):
                             # Sleep to throttle the speed
                             sleep_duration = max(0, target_time_per_sub_chunk - elapsed_for_sub_chunk)
                             time.sleep(sleep_duration)
+                            sum_of_sleep_times += sleep_duration  # Track total sleep time
 
                             read += len(data)
                             bytes_read_in_chunk += len(data)
@@ -171,10 +178,13 @@ class FileReadWorker(QThread):
 
                         # Now calculate metrics for the whole chunk that was just processed
                         chunk_total_time = time.time() - chunk_read_start_time
-                        if chunk_total_time == 0:
+
+                        # we measure actual read time, not including sleep
+                        actual_read_time = chunk_total_time - sum_of_sleep_times
+                        if actual_read_time == 0:
                             speed_val = float('inf')
                         else:
-                            speed_val = (bytes_read_in_chunk / (1024 * 1024)) / chunk_total_time
+                            speed_val = (bytes_read_in_chunk / (1024 * 1024)) / actual_read_time
 
                         # Only perform speed check on full chunks to avoid false negatives at EOF
                         if bytes_read_in_chunk == self.chunk_size and speed_val < self.MIN_SPEED_MB_S:
