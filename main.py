@@ -348,7 +348,7 @@ class MainWindow(QMainWindow):
         self.counter_label = QLabel("Entries: 0")
         counter_layout.addWidget(self.counter_label)
 
-        # Add progress bar for overall scan progress
+        # Progress bar for overall scan progress
         self.overall_progress_bar = QProgressBar()
         self.overall_progress_bar.setMinimum(0)
         self.overall_progress_bar.setMaximum(100)
@@ -362,11 +362,17 @@ class MainWindow(QMainWindow):
         # Start/Stop buttons
         h3 = QHBoxLayout()
         self.b_start = QPushButton("Start")
-        self.b_start.clicked.connect(self.start_scan)
+        self.b_start.clicked.connect(self.start_scan) # Connects to default start
+
+        self.b_retry = QPushButton("Retry Failed")
+        self.b_retry.clicked.connect(self.retry_failed)
+
         self.b_stop = QPushButton("Stop")
         self.b_stop.clicked.connect(self.stop_scan)
         self.b_stop.setEnabled(False)
+
         h3.addWidget(self.b_start)
+        h3.addWidget(self.b_retry)
         h3.addWidget(self.b_stop)
         vbox.addLayout(h3)
 
@@ -534,25 +540,53 @@ class MainWindow(QMainWindow):
         self._update_overall_progress()
 
     def start_scan(self):
+        """Standard start: Checks unchecked files and paused files. Skips OK and BAD."""
+        self._initiate_scan(retry_mode=False)
+
+    def retry_failed(self):
+        """Retry start: Checks ONLY files marked as BAD."""
+        self._initiate_scan(retry_mode=True)
+
+    def _initiate_scan(self, retry_mode=False):
         self.status.setText("Working")
         self.b_start.setEnabled(False)
+        self.b_retry.setEnabled(False)  # Disable retry button too
         self.b_stop.setEnabled(True)
         self.stop_event.clear()
 
         tasks = []
+
+        # Iterate over all files to determine what to add to the queue
         for fpath, stats in self.data.items():
-            if stats.get('verdict') == 'OK':
-                continue
-            size = stats['size']
-            start_bytes = int(stats['progress'] / 100 * size)
+            verdict = stats.get('verdict')
+
+            if retry_mode:
+                # RETRY MODE: Only pick up BAD files
+                if verdict != 'BAD':
+                    continue
+
+                # Reset state for a fresh attempt
+                start_bytes = 0
+                self._reset_file_state(fpath)
+            else:
+                # NORMAL MODE: Skip OK and BAD. Pick up Empty (fresh) or Paused (no verdict yet)
+                if verdict == 'OK' or verdict == 'BAD':
+                    continue
+
+                # Resume from where we left off
+                start_bytes = int(stats['progress'] / 100 * stats['size'])
+
             tasks.append((Path(fpath), start_bytes))
 
         if not tasks:
-            self.status.setText("Nothing to scan")
+            msg = "No failed files to retry" if retry_mode else "Nothing new to scan"
+            self.status.setText(msg)
             self.b_start.setEnabled(True)
+            self.b_retry.setEnabled(True)
             self.b_stop.setEnabled(False)
             return
 
+        # Start the worker (using the updated Worker class provided previously)
         self.worker = FileReadWorker(tasks, 1, self.slider.value(), self.stop_event)
         self.worker.progress.connect(self.update_progress)
         self.worker.current_speed.connect(self.update_current_speed)
@@ -562,12 +596,39 @@ class MainWindow(QMainWindow):
         self.worker.finished_all.connect(self.on_scan_finished)
         self.worker.start()
 
+    def _reset_file_state(self, fpath):
+        """Helper to visually and logically reset a file before retrying"""
+        self.data[fpath]['progress'] = 0
+        self.data[fpath]['verdict'] = ''
+        self.data[fpath]['min_speed'] = None
+
+        # Reset UI columns for this row
+        self._set_item(fpath, 3, "0.00")  # Cur Speed
+        self._set_item(fpath, 4, "")  # Min Speed
+        self._set_item(fpath, 5, "")  # Max Wait
+
+        # Reset Progress Bar
+        for i in range(self.table.rowCount()):
+            # Logic to find row based on logic in your original code
+            # (Assuming relative path matching)
+            if self.folder:
+                rel_path = str(Path(fpath).relative_to(self.folder))
+            else:
+                rel_path = Path(fpath).name
+
+            if self.table.item(i, 0).text() == rel_path:
+                self.table.cellWidget(i, 2).setValue(0)
+                # Clear the verdict cell (remove Red background)
+                self.table.setItem(i, 6, QTableWidgetItem(""))
+                break
+
     def stop_scan(self):
         self.stop_event.set()
 
     def on_scan_finished(self):
         self.status.setText("Stopped")
         self.b_start.setEnabled(True)
+        self.b_retry.setEnabled(True)
         self.b_stop.setEnabled(False)
         self._update_overall_progress()
 
