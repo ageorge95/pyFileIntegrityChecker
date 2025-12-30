@@ -480,7 +480,12 @@ class MainWindow(QMainWindow):
         # 2. Stop save worker
         self.save_worker.stop_worker()
 
-        # 3. Now it's safe to wipe everything
+        # 3. Now recreate the save worker
+        self.save_worker = SaveWorker(data_file)
+        self.save_worker.save_complete.connect(self._on_save_complete)
+        self.save_worker.error_occurred.connect(self._on_save_error)
+
+        # 4. Only now it's safe to wipe everything
         self.data.clear()
         self.table.setRowCount(0)
         self.counter_label.setText("Entries: 0")
@@ -489,7 +494,7 @@ class MainWindow(QMainWindow):
         self.folder = None
         self.folder_label.setText("No folder selected")
 
-        # 4. Delete persistent file
+        # 5. Delete persistent file
         try:
             data_file.unlink(missing_ok=True)
         except Exception as e:
