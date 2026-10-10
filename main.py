@@ -2,20 +2,41 @@ import sys
 import os
 import json
 import time
+from collections import deque
 from pathlib import Path
 from threading import Event
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMutex, QMutexLocker
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QProgressBar, QPushButton, QFileDialog,
-    QSlider, QLabel, QHeaderView, QAbstractItemView, QComboBox, QTextEdit,
-    QMessageBox, QDialog
+    QLabel, QHeaderView, QAbstractItemView, QComboBox, QTextEdit,
+    QMessageBox, QDialog, QDoubleSpinBox, QSpinBox
 )
 from PySide6.QtGui import QIcon
 
 # Store data file in current working directory
 data_file = Path.cwd() / "file_checker_data.json"
 AUTO_SAVE_INTERVAL_MS = 2000  # Save every 2 seconds
+
+# Table columns
+(COL_FILE, COL_SIZE, COL_PROGRESS, COL_DISK_SPEED, COL_MIN_SPEED,
+ COL_MAX_READ, COL_SLOW_EVENTS, COL_VERDICT) = range(8)
+
+# --- Read checking parameters ------------------------------------------------------
+# Read a chunk, time the read call, and fail the file if the reading speed stays
+# below the accepted minimum, or if a single read takes longer than the drive is
+# allowed to take to respond.
+BYTES_PER_MB = 1024 * 1024
+CHUNK_SIZE_MB = 1          # how much is read per measured chunk
+GUI_UPDATE_INTERVAL_S = 0.2   # how often the table is refreshed
+SPEED_WINDOW_S = 1.0          # sliding window behind the "Disk MB/s" reading
+RESPONSE_WARMUP_MB = 1        # checks only start after this much was read from the file,
+                              # so a slow start (spin-up, first sector) never fails a file
+
+# Defaults of the GUI parameters
+MIN_CHUNK_SPEED_MB_S = 10.0   # "Fail below (MB/s)"
+MAX_SLOW_EVENTS = 50          # "Fail after N slow checks"
+MAX_RESPONSE_S = 10.0         # "No response for (s)"
 
 def get_running_path(relative_path):
     if '_internal' in os.listdir():
@@ -26,7 +47,6 @@ def get_running_path(relative_path):
 
 class SaveWorker(QThread):
     """Thread for saving data to avoid GUI freezes"""
-    save_complete = Signal()
     error_occurred = Signal(str)
 
     def __init__(self, data_file):
@@ -72,7 +92,6 @@ class SaveWorker(QThread):
                     else:  # Unix-like systems
                         temp_file.replace(self.data_file)
 
-                    self.save_complete.emit()
                 except Exception as e:
                     self.error_occurred.emit(f"Error saving data: {e}")
 
@@ -87,35 +106,29 @@ class SaveWorker(QThread):
 
 class FileReadWorker(QThread):
     progress = Signal(str, int)
-    current_speed = Signal(str, float)
-    min_speed = Signal(str, float)
-    max_wait = Signal(str, float)
-    verdict = Signal(str, bool)
+    disk_speed = Signal(str, float)   # throughput of the last SPEED_WINDOW_S seconds
+    min_speed = Signal(str, float)    # lowest windowed throughput seen
+    max_read = Signal(str, float)     # longest single read (ms)
+    slow_events = Signal(str, int)  # checks that were below the minimum speed
+    verdict = Signal(str, bool, str)     # path, ok, human readable reason
     finished_all = Signal()
 
-    # Threshold: fail if chunk speed too low
-    MIN_SPEED_MB_S = 0.1  # MB/s
-
-    def __init__(self, tasks, chunk_size_mb, speed_limit_mb_s, stop_event):
+    def __init__(self, tasks, chunk_size_mb, stop_event, min_chunk_speed_mb_s=MIN_CHUNK_SPEED_MB_S,
+                 max_slow_events=MAX_SLOW_EVENTS, max_response_s=MAX_RESPONSE_S):
         super().__init__()
         self.tasks = tasks
-        # We ignore the passed chunk_size_mb for reading logic to optimize for speed,
-        # but we use it for the file verdict logic if needed.
-        self.speed_limit_mb = speed_limit_mb_s
+        self.chunk_size_mb = chunk_size_mb
         self.stop_event = stop_event
-
-    @property
-    def speed_limit(self):
-        """Allow dynamic speed limit updates"""
-        return self.speed_limit_mb
-
-    @speed_limit.setter
-    def speed_limit(self, val):
-        self.speed_limit_mb = val
+        # The 1-second reading speed must stay above this.
+        self.min_chunk_speed_mb_s = min_chunk_speed_mb_s
+        # ... this many checks in a row below it => BAD (drives may retry now and then).
+        self.max_slow_events = max_slow_events
+        # A single read slower than this => BAD (the drive is not responding).
+        self.max_response_s = max_response_s
 
     def run(self):
-        GUI_UPDATE_INTERVAL_S = 0.2
-        BYTES_PER_MB = 1024 * 1024
+        chunk_bytes = int(self.chunk_size_mb * BYTES_PER_MB)
+        warmup_bytes = int(RESPONSE_WARMUP_MB * BYTES_PER_MB)
 
         for path, start in self.tasks:
             if self.stop_event.is_set():
@@ -124,100 +137,128 @@ class FileReadWorker(QThread):
             try:
                 file_size = path.stat().st_size
                 if file_size == 0:
-                    self.verdict.emit(str(path), True)
+                    self.verdict.emit(str(path), True, "empty file")
                     self.progress.emit(str(path), 100)
                     continue
 
                 read_total = start
-                min_speed_val = float('inf')
-                max_wait_val = 0
                 completed = False
+                slow_event_count = 0
+                max_read_s = 0.0
+                min_window_mb_s = None
 
-                last_gui_update_time = time.time()
+                # Sliding window of the last SPEED_WINDOW_S seconds of reading,
+                # so a dip shows up immediately instead of being averaged away.
+                window = deque()
+                window_time = 0.0
+                window_bytes = 0
 
-                # Use perf_counter for high precision timing
                 start_time = time.perf_counter()
-                bytes_read_since_start = 0
+                last_update = start_time
+                buffer = bytearray(chunk_bytes)
+                view = memoryview(buffer)
 
-                with open(path, 'rb') as f:
+                # buffering=0 -> raw reads, no hidden readahead copy, so only the
+                # drive itself is inside the measured read duration.
+                with open(path, 'rb', buffering=0) as f:
                     f.seek(read_total)
 
                     while read_total < file_size:
                         if self.stop_event.is_set():
                             break
 
-                        # Dynamic buffer size: Read roughly 50ms of data at a time
-                        # This balances CPU overhead (too small chunks) vs UI lag (too big chunks)
-                        target_speed_bytes = self.speed_limit_mb * BYTES_PER_MB
-                        # minimal buffer 64KB, max 4MB
-                        buffer_size = int(max(64 * 1024, min(4 * 1024 * 1024, target_speed_bytes * 0.05)))
+                        # Bytes already read from this file before this chunk.
+                        read_before = read_total - start
+                        want = min(chunk_bytes, file_size - read_total)
 
-                        # Cap buffer to remaining file size
-                        bytes_to_read = min(buffer_size, file_size - read_total)
+                        # 1. Read a chunk and time the read call.
+                        read_t0 = time.perf_counter()
+                        filled = 0
+                        while filled < want:
+                            got = f.readinto(view[filled:want])
+                            if not got:
+                                break
+                            filled += got
+                        read_s = time.perf_counter() - read_t0
 
-                        # 1. Read the data
-                        chunk_t0 = time.perf_counter()
-                        data = f.read(bytes_to_read)
-                        if not data:
+                        if filled <= 0:
                             break
 
-                        read_duration = time.perf_counter() - chunk_t0
-                        bytes_read = len(data)
-                        read_total += bytes_read
-                        bytes_read_since_start += bytes_read
+                        read_total += filled
+                        max_read_s = max(max_read_s, read_s)
 
-                        # 2. Calculate Instant Speed (Raw disk speed without sleep)
-                        # We use this for the "Min Speed" verdict check
-                        if read_duration > 0:
-                            instant_mb_s = (bytes_read / BYTES_PER_MB) / read_duration
-                            if instant_mb_s < self.MIN_SPEED_MB_S:
-                                # Only fail if it's genuinely the disk being slow, not our throttle
-                                self.verdict.emit(str(path), False)
-                                break
+                        window.append((read_s, filled))
+                        window_time += read_s
+                        window_bytes += filled
+                        while len(window) > 1 and window_time - window[0][0] >= SPEED_WINDOW_S:
+                            dropped_time, dropped_bytes = window.popleft()
+                            window_time -= dropped_time
+                            window_bytes -= dropped_bytes
 
-                        # 3. Throttling Logic (Accumulator Approach)
-                        # How much time *should* have passed to achieve target speed?
-                        target_duration = bytes_read_since_start / target_speed_bytes
-                        actual_duration = time.perf_counter() - start_time
+                        window_mb_s = (window_bytes / BYTES_PER_MB) / window_time if window_time > 0 else 0.0
+                        if min_window_mb_s is None or window_mb_s < min_window_mb_s:
+                            min_window_mb_s = window_mb_s
 
-                        sleep_needed = target_duration - actual_duration
+                        # 2. Verdict, judged on the same 1-second throughput that the
+                        #    table shows, so "Min MB/s" below the limit means BAD.
+                        #    Slow checks are counted cumulatively, not in a row: one
+                        #    retry poisons the 1 s window for a whole second, so
+                        #    "in a row" would mean something quite different.
+                        #    Checks only start after the warm-up, so a slow start
+                        #    (spin-up, first sector) never fails a file.
+                        failed = False
+                        reason = ""
+                        if read_before >= warmup_bytes:
+                            if read_s > self.max_response_s:
+                                failed = True          # the drive stopped responding
+                                reason = (f"no response: a {self.chunk_size_mb:g} MB read took "
+                                          f"{read_s:.1f} s (limit {self.max_response_s:g} s)")
+                            elif window_mb_s < self.min_chunk_speed_mb_s:
+                                slow_event_count += 1
+                                failed = slow_event_count >= self.max_slow_events
+                                reason = (f"{slow_event_count} slow checks below "
+                                          f"{self.min_chunk_speed_mb_s:g} MB/s "
+                                          f"(last {window_mb_s:.2f} MB/s)")
 
-                        if sleep_needed > 0:
-                            time.sleep(sleep_needed)
-                            max_wait_val = max(max_wait_val, sleep_needed)
+                        if failed:
+                            self.progress.emit(str(path), int(read_total * 100 / file_size))
+                            self.disk_speed.emit(str(path), window_mb_s)
+                            self.min_speed.emit(str(path), min_window_mb_s or 0.0)
+                            self.max_read.emit(str(path), max_read_s * 1000.0)
+                            self.slow_events.emit(str(path), slow_event_count)
+                            self.verdict.emit(str(path), False, reason)
+                            break
 
-                        # 4. Update GUI stats
-                        now = time.time()
-                        if now - last_gui_update_time > GUI_UPDATE_INTERVAL_S:
-                            # Calculate effective speed over the total duration
-                            total_elapsed = time.perf_counter() - start_time
-                            effective_speed = (
-                                                          bytes_read_since_start / BYTES_PER_MB) / total_elapsed if total_elapsed > 0 else 0
+                        # 3. Update GUI stats
+                        now = time.perf_counter()
+                        if now - last_update >= GUI_UPDATE_INTERVAL_S:
+                            last_update = now
 
-                            min_speed_val = min(min_speed_val, effective_speed)
-                            pct = int(read_total * 100 / file_size)
+                            self.progress.emit(str(path), int(read_total * 100 / file_size))
+                            self.disk_speed.emit(str(path), window_mb_s)
+                            self.min_speed.emit(str(path), min_window_mb_s)
+                            self.max_read.emit(str(path), max_read_s * 1000.0)
+                            self.slow_events.emit(str(path), slow_event_count)
 
-                            self.current_speed.emit(str(path), effective_speed)
-                            self.progress.emit(str(path), pct)
-                            self.min_speed.emit(str(path), min_speed_val)
-                            self.max_wait.emit(str(path), max_wait_val)
-                            last_gui_update_time = now
+                        if filled < want:
+                            completed = read_total >= file_size
+                            break
                     else:
                         completed = True
 
                 if completed:
-                    final_elapsed = time.perf_counter() - start_time
-                    final_speed = (bytes_read_since_start / BYTES_PER_MB) / final_elapsed if final_elapsed > 0 else 0
-
+                    reason = (f"read {read_total / BYTES_PER_MB:.0f} MB, "
+                              f"{slow_event_count} slow checks, longest read {max_read_s * 1000:.0f} ms")
                     self.progress.emit(str(path), 100)
-                    self.current_speed.emit(str(path), final_speed)
-                    self.min_speed.emit(str(path), min(min_speed_val, final_speed))
-                    self.max_wait.emit(str(path), max_wait_val)
-                    self.verdict.emit(str(path), True)
+                    self.disk_speed.emit(str(path), window_mb_s)
+                    self.min_speed.emit(str(path), min_window_mb_s or 0.0)
+                    self.max_read.emit(str(path), max_read_s * 1000.0)
+                    self.slow_events.emit(str(path), slow_event_count)
+                    self.verdict.emit(str(path), True, reason)
 
             except Exception as e:
                 print(f"Error processing {path}: {e}")
-                self.verdict.emit(str(path), False)
+                self.verdict.emit(str(path), False, f"read error: {e}")
 
         self.finished_all.emit()
 
@@ -276,15 +317,16 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._load_data()
 
-        # Create save worker
-        self.save_worker = SaveWorker(data_file)
-        self.save_worker.save_complete.connect(self._on_save_complete)
-        self.save_worker.error_occurred.connect(self._on_save_error)
+        self._start_save_worker()
 
         # Timer to trigger saves
         self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self._schedule_save)
         self.autosave_timer.start(AUTO_SAVE_INTERVAL_MS)
+
+    def _start_save_worker(self):
+        self.save_worker = SaveWorker(data_file)
+        self.save_worker.error_occurred.connect(self._on_save_error)
 
     def _setup_ui(self):
         widget = QWidget()
@@ -304,17 +346,59 @@ class MainWindow(QMainWindow):
         self.btn_add_files.clicked.connect(self.add_files_manually)
         h1.addWidget(self.btn_add_files)
 
-        # Speed slider
+        # Minimum acceptable read speed - the one parameter that decides the verdict
         h2 = QHBoxLayout()
-        h2.addWidget(QLabel("Speed (MB/s):"))
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(1, 200)
-        self.slider.setValue(10)
-        self.slider.valueChanged.connect(self.on_speed_change)
-        self.speed_label = QLabel(f"{self.slider.value()} MB/s")
-        h2.addWidget(self.slider)
-        h2.addWidget(self.speed_label)
+        h2.addWidget(QLabel("Fail below (MB/s):"))
+        self.min_speed_box = QDoubleSpinBox()
+        self.min_speed_box.setRange(0.01, 500.0)
+        self.min_speed_box.setDecimals(2)
+        self.min_speed_box.setSingleStep(0.5)
+        self.min_speed_box.setValue(MIN_CHUNK_SPEED_MB_S)
+        self.min_speed_box.setSuffix(" MB/s")
+        self.min_speed_box.setToolTip("A file whose reading speed stays below this is marked BAD, "
+                                      "but only after the consecutive checks below are reached.")
+        self.min_speed_box.valueChanged.connect(self.on_min_speed_change)
+        h2.addWidget(self.min_speed_box)
+        self.min_speed_label = QLabel()
+        h2.addWidget(self.min_speed_label)
+        h2.addStretch()
         vbox.addLayout(h2)
+
+        # Tolerances: retries are fine, a drive that stops responding is not
+        h2b = QHBoxLayout()
+        h2b.addWidget(QLabel("Fail after N slow checks:"))
+        self.slow_checks_box = QSpinBox()
+        self.slow_checks_box.setRange(1, 1000000)
+        self.slow_checks_box.setValue(MAX_SLOW_EVENTS)
+        self.slow_checks_box.setToolTip("Total number of slow checks allowed per file. A drive may "
+                                         "retry now and then, so this has to be reached before a file "
+                                         "is marked BAD.")
+        self.slow_checks_box.valueChanged.connect(self.on_slow_checks_change)
+        h2b.addWidget(self.slow_checks_box)
+        self.slow_checks_label = QLabel()
+        h2b.addWidget(self.slow_checks_label)
+        h2b.addStretch()
+        vbox.addLayout(h2b)
+
+        h2c = QHBoxLayout()
+        h2c.addWidget(QLabel("No response for (s):"))
+        self.response_box = QDoubleSpinBox()
+        self.response_box.setRange(0.1, 3600.0)
+        self.response_box.setDecimals(1)
+        self.response_box.setValue(MAX_RESPONSE_S)
+        self.response_box.setSuffix(" s")
+        self.response_box.setToolTip("A single read that takes longer than this means the drive is "
+                                     "not responding and the file is marked BAD immediately. "
+                                     f"Ignored until {RESPONSE_WARMUP_MB:g} MB has been read from the file.")
+        self.response_box.valueChanged.connect(self.on_response_change)
+        h2c.addWidget(self.response_box)
+        self.response_label = QLabel()
+        h2c.addWidget(self.response_label)
+        h2c.addStretch()
+        vbox.addLayout(h2c)
+        self.on_slow_checks_change(self.slow_checks_box.value())
+        self.on_response_change(self.response_box.value())
+        self.on_min_speed_change(self.min_speed_box.value())
 
         # Filter dropdown for verdict
         h_filter = QHBoxLayout()
@@ -331,16 +415,30 @@ class MainWindow(QMainWindow):
         vbox.addWidget(self.status)
 
         # Files table
-        self.table = QTableWidget(0, 7)
-        headers = ["File", "Size", "Progress", "Cur Speed", "Min Speed", "Max Wait", "Verdict"]
+        self.table = QTableWidget(0, 8)
+        headers = ["File", "Size", "Progress", "Disk MB/s", "Min MB/s",
+                   "Max Read (ms)", "Slow Events", "Verdict"]
         self.table.setHorizontalHeaderLabels(headers)
         # Light blue selection
         self.table.setStyleSheet("QTableWidget::item:selected { background-color: lightblue; color: black; }")
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         hdr = self.table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in range(1, 7):
+        hdr.setSectionResizeMode(COL_FILE, QHeaderView.Stretch)
+        for col in range(COL_SIZE, COL_VERDICT + 1):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+
+        tooltips = {
+            COL_DISK_SPEED: "Throughput of the last second of reading. Dips when the drive stalls. "
+                            "Can be inflated by the OS file cache.",
+            COL_MIN_SPEED: "Lowest 1-second throughput seen for this file. Below the "
+                          "'Fail below' setting means the file is marked BAD.",
+            COL_MAX_READ: "Longest single read call - this is where the drive dropped to zero.",
+            COL_SLOW_EVENTS: "Number of checks that were below the 'Fail below' speed. "
+                             "'Fail after N slow checks' of them in a row marks the file BAD.",
+        }
+        for col, tip in tooltips.items():
+            self.table.horizontalHeaderItem(col).setToolTip(tip)
+
         vbox.addWidget(self.table)
 
         # Counter label and progress bar
@@ -415,15 +513,12 @@ class MainWindow(QMainWindow):
         if self.data:
             state = {
                 'folder': str(self.folder) if self.folder else '',
-                'speed_limit': self.slider.value(),
+                'min_chunk_speed': self.min_speed_box.value(),
+                'max_slow_events': self.slow_checks_box.value(),
+                'max_response_s': self.response_box.value(),
                 'files': self.data
             }
             self.save_worker.schedule_save(state)
-
-    def _on_save_complete(self):
-        """Called when save operation completes successfully"""
-        # Optional: You could add a brief status message here
-        pass
 
     def _on_save_error(self, error_msg):
         """Called when save operation fails"""
@@ -441,22 +536,8 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(row0 + len(files))
 
         for offset, f in enumerate(files):
-            row = row0 + offset
-            self.data[str(f)] = {
-                'size': f.stat().st_size,
-                'progress': 0,
-                'cur_speed': 0.0,
-                'min_speed': None,
-                'max_wait': None,
-                'verdict': ''
-            }
-            self.table.setItem(row, 0, QTableWidgetItem(f.name))
-            self.table.setItem(row, 1, QTableWidgetItem(self._format_size(f.stat().st_size)))
-            self.table.setCellWidget(row, 2, QProgressBar(value=0))
-            self.table.setItem(row, 3, QTableWidgetItem("0.00"))
-            self.table.setItem(row, 4, QTableWidgetItem(""))
-            self.table.setItem(row, 5, QTableWidgetItem(""))
-            self.table.setItem(row, 6, QTableWidgetItem(""))
+            self.data[str(f)] = stats = self._new_stats(f.stat().st_size)
+            self._fill_row(row0 + offset, f.name, stats)
 
         # update the visible-rows counter and re-apply the current filter
         self.counter_label.setText(f"Entries: {self.table.rowCount()}")
@@ -481,9 +562,7 @@ class MainWindow(QMainWindow):
         self.save_worker.stop_worker()
 
         # 3. Now recreate the save worker
-        self.save_worker = SaveWorker(data_file)
-        self.save_worker.save_complete.connect(self._on_save_complete)
-        self.save_worker.error_occurred.connect(self._on_save_error)
+        self._start_save_worker()
 
         # 4. Only now it's safe to wipe everything
         self.data.clear()
@@ -500,14 +579,27 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print("Could not delete data file:", e)
 
-    def on_speed_change(self, value):
-        self.speed_label.setText(f"{value} MB/s")
+    def on_min_speed_change(self, value):
+        self.min_speed_label.setText(
+            f"(the {SPEED_WINDOW_S:g} s reading speed must stay above {value:g} MB/s)")
         if self.worker:
-            self.worker.speed_limit = value
+            self.worker.min_chunk_speed_mb_s = value
+
+    def on_slow_checks_change(self, value):
+        self.slow_checks_label.setText(
+            "(slow checks allowed per file before it is marked BAD)")
+        if self.worker:
+            self.worker.max_slow_events = value
+
+    def on_response_change(self, value):
+        self.response_label.setText(
+            f"(ignored for the first {RESPONSE_WARMUP_MB:g} MB of every file)")
+        if self.worker:
+            self.worker.max_response_s = value
 
     def apply_filter(self, text):
         for i in range(self.table.rowCount()):
-            item = self.table.item(i, 6)
+            item = self.table.item(i, COL_VERDICT)
             val = item.text() if item else ""
             if text == "All":
                 self.table.setRowHidden(i, False)
@@ -522,26 +614,43 @@ class MainWindow(QMainWindow):
     def _format_size(self, b):
         return f"{b / 1024 ** 3:.2f} GB" if b >= 1024 ** 3 else f"{b / 1024 ** 2:.2f} MB"
 
+    @staticmethod
+    def _new_stats(size):
+        return {'size': size, 'progress': 0, 'disk_speed': 0.0, 'min_speed': None,
+                'max_read_ms': 0.0, 'slow_events': 0, 'reason': '', 'verdict': ''}
+
+    def _fill_row(self, row, display_name, stats):
+        self.table.setItem(row, COL_FILE, QTableWidgetItem(display_name))
+        self.table.setItem(row, COL_SIZE, QTableWidgetItem(self._format_size(stats['size'])))
+        self.table.setCellWidget(row, COL_PROGRESS, QProgressBar(value=stats['progress']))
+        self.table.setItem(row, COL_DISK_SPEED,
+                           QTableWidgetItem("" if not stats['disk_speed'] else f"{stats['disk_speed']:.2f}"))
+        self.table.setItem(row, COL_MIN_SPEED,
+                           QTableWidgetItem("" if stats['min_speed'] is None else f"{stats['min_speed']:.2f}"))
+        self.table.setItem(row, COL_MAX_READ,
+                           QTableWidgetItem("" if not stats['max_read_ms'] else f"{stats['max_read_ms']:.0f}"))
+        self.table.setItem(row, COL_SLOW_EVENTS, QTableWidgetItem(str(stats['slow_events'])))
+        verdict = stats['verdict']
+        item = QTableWidgetItem(verdict)
+        if verdict == 'OK':
+            item.setBackground(Qt.green)
+        elif verdict == 'BAD':
+            item.setBackground(Qt.red)
+        if stats['reason']:
+            item.setToolTip(stats['reason'])
+        self.table.setItem(row, COL_VERDICT, item)
+
     def _populate_table(self):
         # Get all files recursively from all subfolders
         files = [f for f in self.folder.rglob('*') if f.is_file()]
         self.table.setRowCount(len(files))
-        # update counter
-        self.counter_label.setText(f"Entries: {len(files)}")
         self.data = {}
         for i, f in enumerate(files):
-            name = str(f.relative_to(self.folder))  # Show relative path from root folder
-            size = f.stat().st_size
-            self.data[str(f)] = {'size': size, 'progress': 0, 'cur_speed': 0.0,
-                                 'min_speed': None, 'max_wait': None, 'verdict': ''}
-            self.table.setItem(i, 0, QTableWidgetItem(name))
-            self.table.setItem(i, 1, QTableWidgetItem(self._format_size(size)))
-            self.table.setCellWidget(i, 2, QProgressBar(value=0))
-            self.table.setItem(i, 3, QTableWidgetItem("0.00"))
-            self.table.setItem(i, 4, QTableWidgetItem(""))
-            self.table.setItem(i, 5, QTableWidgetItem(""))
-            self.table.setItem(i, 6, QTableWidgetItem(""))
+            # Show relative path from root folder
+            self.data[str(f)] = stats = self._new_stats(f.stat().st_size)
+            self._fill_row(i, str(f.relative_to(self.folder)), stats)
 
+        self.counter_label.setText(f"Entries: {len(files)}")
         self._update_overall_progress()
 
     def start_scan(self):
@@ -592,11 +701,15 @@ class MainWindow(QMainWindow):
             return
 
         # Start the worker (using the updated Worker class provided previously)
-        self.worker = FileReadWorker(tasks, 1, self.slider.value(), self.stop_event)
+        self.worker = FileReadWorker(tasks, CHUNK_SIZE_MB, self.stop_event,
+                                       self.min_speed_box.value(),
+                                       self.slow_checks_box.value(),
+                                       self.response_box.value())
         self.worker.progress.connect(self.update_progress)
-        self.worker.current_speed.connect(self.update_current_speed)
+        self.worker.disk_speed.connect(self.update_disk_speed)
         self.worker.min_speed.connect(self.update_min_speed)
-        self.worker.max_wait.connect(self.update_max_wait)
+        self.worker.max_read.connect(self.update_max_read)
+        self.worker.slow_events.connect(self.update_slow_events)
         self.worker.verdict.connect(self.update_verdict)
         self.worker.finished_all.connect(self.on_scan_finished)
         self.worker.start()
@@ -606,26 +719,20 @@ class MainWindow(QMainWindow):
         self.data[fpath]['progress'] = 0
         self.data[fpath]['verdict'] = ''
         self.data[fpath]['min_speed'] = None
+        self.data[fpath]['max_read_ms'] = 0.0
+        self.data[fpath]['slow_events'] = 0
 
         # Reset UI columns for this row
-        self._set_item(fpath, 3, "0.00")  # Cur Speed
-        self._set_item(fpath, 4, "")  # Min Speed
-        self._set_item(fpath, 5, "")  # Max Wait
+        self._set_item(fpath, COL_DISK_SPEED, "")
+        self._set_item(fpath, COL_MIN_SPEED, "")
+        self._set_item(fpath, COL_MAX_READ, "")
+        self._set_item(fpath, COL_SLOW_EVENTS, "")
 
-        # Reset Progress Bar
-        for i in range(self.table.rowCount()):
-            # Logic to find row based on logic in your original code
-            # (Assuming relative path matching)
-            if self.folder:
-                rel_path = str(Path(fpath).relative_to(self.folder))
-            else:
-                rel_path = Path(fpath).name
-
-            if self.table.item(i, 0).text() == rel_path:
-                self.table.cellWidget(i, 2).setValue(0)
-                # Clear the verdict cell (remove Red background)
-                self.table.setItem(i, 6, QTableWidgetItem(""))
-                break
+        # Reset Progress Bar and clear the verdict cell (remove the red background)
+        row = self._row_for(fpath)
+        if row >= 0:
+            self.table.cellWidget(row, COL_PROGRESS).setValue(0)
+            self.table.setItem(row, COL_VERDICT, QTableWidgetItem(""))
 
     def stop_scan(self):
         self.stop_event.set()
@@ -642,70 +749,68 @@ class MainWindow(QMainWindow):
             return
         self.data[fname]['progress'] = p
 
-        # Convert to relative path for comparison
-        if self.folder:
-            rel_path = str(Path(fname).relative_to(self.folder))
-        else:
-            rel_path = Path(fname).name
+        row = self._row_for(fname)
+        if row >= 0:
+            # Only update the progress bar widget, not replace it
+            self.table.cellWidget(row, COL_PROGRESS).setValue(p)
 
-        for i in range(self.table.rowCount()):
-            if self.table.item(i, 0).text() == rel_path:
-                # Only update the progress bar widget, not replace it
-                self.table.cellWidget(i, 2).setValue(p)
-                break
-
-    def update_current_speed(self, fname, speed):
+    def update_disk_speed(self, fname, speed):
         if fname not in self.data:
             return
-        self.data[fname]['cur_speed'] = speed
-        self._set_item(fname, 3, f"{speed:.2f}")
+        self.data[fname]['disk_speed'] = speed
+        self._set_item(fname, COL_DISK_SPEED, f"{speed:.2f}")
 
     def update_min_speed(self, fname, s):
         if fname not in self.data:
             return
         self.data[fname]['min_speed'] = s
-        self._set_item(fname, 4, f"{s:.2f}")
+        self._set_item(fname, COL_MIN_SPEED, f"{s:.2f}")
 
-    def update_max_wait(self, fname, w):
+    def update_max_read(self, fname, max_ms):
         if fname not in self.data:
             return
-        self.data[fname]['max_wait'] = w
-        self._set_item(fname, 5, f"{w:.3f}")
+        self.data[fname]['max_read_ms'] = max_ms
+        self._set_item(fname, COL_MAX_READ, f"{max_ms:.0f}")
 
-    def update_verdict(self, fname, ok):
+    def update_slow_events(self, fname, count):
+        if fname not in self.data:
+            return
+        self.data[fname]['slow_events'] = count
+        self._set_item(fname, COL_SLOW_EVENTS, str(count))
+
+    def update_verdict(self, fname, ok, reason):
         if fname not in self.data:
             return
         text = 'OK' if ok else 'BAD'
         self.data[fname]['verdict'] = text
+        self.data[fname]['reason'] = reason
         item = QTableWidgetItem(text)
         item.setBackground(Qt.green if ok else Qt.red)
-        self._place_item(fname, 6, item)
+        item.setToolTip(reason)
+        self._place_item(fname, COL_VERDICT, item)
         # Update overall progress when a file gets a verdict
         self._update_overall_progress()
 
-    def _set_item(self, fpath, col, val):
-        # Convert to relative path for comparison
-        if self.folder:
-            rel_path = str(Path(fpath).relative_to(self.folder))
+    def _row_for(self, fpath):
+        """Table row showing fpath, or -1 when the file is not listed"""
+        fpath = Path(fpath)
+        if self.folder and fpath.is_relative_to(self.folder):
+            rel_path = str(fpath.relative_to(self.folder))
         else:
-            rel_path = Path(fpath).name
+            rel_path = fpath.name
 
         for i in range(self.table.rowCount()):
-            if self.table.item(i, 0).text() == rel_path:
-                self.table.setItem(i, col, QTableWidgetItem(val))
-                break
+            if self.table.item(i, COL_FILE).text() == rel_path:
+                return i
+        return -1
+
+    def _set_item(self, fpath, col, val):
+        self._place_item(fpath, col, QTableWidgetItem(val))
 
     def _place_item(self, fpath, col, item):
-        # Convert to relative path for comparison
-        if self.folder:
-            rel_path = str(Path(fpath).relative_to(self.folder))
-        else:
-            rel_path = Path(fpath).name
-
-        for i in range(self.table.rowCount()):
-            if self.table.item(i, 0).text() == rel_path:
-                self.table.setItem(i, col, item)
-                break
+        row = self._row_for(fpath)
+        if row >= 0:
+            self.table.setItem(row, col, item)
 
     def _load_data(self):
         if not data_file.exists():
@@ -713,8 +818,11 @@ class MainWindow(QMainWindow):
         try:
             state = json.loads(data_file.read_text())
 
-            # restore speed slider
-            self.slider.setValue(state.get('speed_limit', 10))
+            # restore the checking parameters
+            self.min_speed_box.setValue(state.get('min_chunk_speed', MIN_CHUNK_SPEED_MB_S))
+            self.slow_checks_box.setValue(state.get('max_slow_events',
+                                                     state.get('max_consecutive_slow', MAX_SLOW_EVENTS)))
+            self.response_box.setValue(state.get('max_response_s', MAX_RESPONSE_S))
 
             # restore last folder if it still exists
             folder = state.get('folder', '')
@@ -723,7 +831,6 @@ class MainWindow(QMainWindow):
                 self.folder_label.setText(folder)
 
             # restore *all* valid file entries, no matter where they are
-            restored_files = 0
             for fpath_str, stats in state.get('files', {}).items():
                 fpath = Path(fpath_str)
                 if not fpath.is_file():
@@ -732,12 +839,13 @@ class MainWindow(QMainWindow):
                 self.data[str(fpath)] = {
                     'size': fpath.stat().st_size,
                     'progress': stats.get('progress', 0),
-                    'cur_speed': stats.get('cur_speed', 0.0),
+                    'disk_speed': stats.get('disk_speed', 0.0),
                     'min_speed': stats.get('min_speed'),
-                    'max_wait': stats.get('max_wait'),
+                    'max_read_ms': stats.get('max_read_ms', stats.get('max_stall_ms', 0.0)),
+                    'slow_events': stats.get('slow_events', 0),
+                    'reason': stats.get('reason', ''),
                     'verdict': stats.get('verdict', '')
                 }
-                restored_files += 1
 
             # rebuild the table to show all restored entries
             self._repopulate_table_from_data()
@@ -749,7 +857,6 @@ class MainWindow(QMainWindow):
 
     # helper: recreate the table from self.data
     def _repopulate_table_from_data(self):
-        self.table.setRowCount(0)
         self.table.setRowCount(len(self.data))
         for row, (fpath_str, stats) in enumerate(self.data.items()):
             fpath = Path(fpath_str)
@@ -760,22 +867,7 @@ class MainWindow(QMainWindow):
             else:
                 display_name = fpath.name
 
-            self.table.setItem(row, 0, QTableWidgetItem(display_name))
-            self.table.setItem(row, 1, QTableWidgetItem(self._format_size(stats['size'])))
-            bar = QProgressBar(value=stats['progress'])
-            self.table.setCellWidget(row, 2, bar)
-            self.table.setItem(row, 3, QTableWidgetItem(f"{stats['cur_speed']:.2f}"))
-            self.table.setItem(row, 4,
-                               QTableWidgetItem("" if stats['min_speed'] is None else f"{stats['min_speed']:.2f}"))
-            self.table.setItem(row, 5,
-                               QTableWidgetItem("" if stats['max_wait'] is None else f"{stats['max_wait']:.3f}"))
-            verdict = stats.get('verdict', '')
-            item = QTableWidgetItem(verdict)
-            if verdict == 'OK':
-                item.setBackground(Qt.green)
-            elif verdict == 'BAD':
-                item.setBackground(Qt.red)
-            self.table.setItem(row, 6, item)
+            self._fill_row(row, display_name, stats)
 
         self.counter_label.setText(f"Entries: {len(self.data)}")
 

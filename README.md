@@ -5,8 +5,8 @@ The storage medium of the files does not matter, it can be an HDD, SSD or even a
 
 ## Highlights:
 - able to select the folder containing the files to check directly in the GUI
-- able to select the read speed directly in the GUI
-- easy way to visualise all the files to be checked and various statistics about the checking progress (the actual progress, current reading speed, minimum speed, max wait time ...)
+- one parameter decides the verdict: the read speed below which a chunk counts as slow
+- easy way to visualise all the files to be checked and various statistics about the checking progress (the actual progress, current disk speed, minimum speed, longest read ...)
 - easy way to filter through the files by verdict
 - able to start/ stop the checking process at any time
 - the progress is saved every 2 seconds so you will never loose the checking progress, even if the computer crashes
