@@ -5,3 +5,5 @@
 /build
 /dist
 file_checker_data.json
+/activate.ps1
+/activate.sh

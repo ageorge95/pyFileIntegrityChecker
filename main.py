@@ -1,5 +1,6 @@
 import sys
 import os
+import ctypes
 import json
 import time
 from collections import deque
@@ -16,6 +17,9 @@ from PySide6.QtGui import QIcon
 
 # Store data file in current working directory
 data_file = Path.cwd() / "file_checker_data.json"
+
+APP_ID = 'AG95.pyFileIntegrityChecker'
+ICON_FILE = 'icon.ico'
 AUTO_SAVE_INTERVAL_MS = 2000  # Save every 2 seconds
 
 # Table columns
@@ -39,10 +43,19 @@ MAX_SLOW_EVENTS = 50          # "Fail after N slow checks"
 MAX_RESPONSE_S = 10.0         # "No response for (s)"
 
 def get_running_path(relative_path):
-    if '_internal' in os.listdir():
-        return os.path.join('_internal', relative_path)
-    else:
-        return relative_path
+    """Return a bundled file's path in both source and PyInstaller builds."""
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
+
+def set_windows_app_id():
+    """Give the app its own Windows taskbar identity."""
+    if sys.platform != 'win32':
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except (AttributeError, OSError):
+        pass
 
 
 class SaveWorker(QThread):
@@ -307,7 +320,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("pyFileIntegrityChecker v" + open(get_running_path('version.txt')).read())
-        self.setWindowIcon(QIcon(get_running_path('icon.ico')))
+        self.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
         self.resize(800, 600)
         self.data = {}
         self.folder = None
@@ -872,7 +885,9 @@ class MainWindow(QMainWindow):
         self.counter_label.setText(f"Entries: {len(self.data)}")
 
 if __name__ == '__main__':
+    set_windows_app_id()
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(get_running_path(ICON_FILE)))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
